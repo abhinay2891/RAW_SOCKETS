@@ -1,0 +1,458 @@
+#!/usr/bin/python
+
+import socket,IN
+import sys
+import urlparse
+import re
+from struct import *
+import random
+import os
+import subprocess
+import binascii
+
+total_data = ""
+
+
+dest_port = 80
+i = random.randint(100,1000)
+j = random.randint(5000,60000)
+src_port = j - i
+url = sys.argv[1]
+window = socket.htons(5840)
+cwnd_size = 1
+ssh_trsh = 0
+###TCP header fields#
+d_off = 5
+doff_res = (d_off << 4) +0
+urgf = 0
+rstf = 0
+chk_sum = 0
+urg_ptr = 0
+
+### IP header fields##
+ip_version = 4
+initial_header_len = 5
+version_IHL = (ip_version << 4) + initial_header_len
+type_of_service = 0
+total_length = 0 
+packet_ID = random.randint(10000,30000)
+dont_fragment = 0
+fragment_status = dont_fragment
+TTL = 255
+protocol = socket.IPPROTO_TCP
+
+
+
+###################################################################################################################
+def get_my_ip():						#Extracting IP address 
+	global source_ip
+	initial_sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+	initial_sock.connect(("google.com",dest_port))
+	source_ip = initial_sock.getsockname()[0]
+	initial_sock.close()
+	return source_ip
+	
+
+
+def url_parser(url):        # parsing url to extract hostname and pathname
+	global url_hostname
+	global url_pathname
+	global file_name
+	url_obj = re.search('http://',url)
+	if not url_obj:
+		url = 'http://'+url
+	parsed_url = urlparse.urlparse(url)
+	url_hostname = parsed_url[1]
+	url_pathname = parsed_url[2]
+	if url.split('/')[-1] == "" :      # create a file name for data retrieved, if no path is given save it as index.html
+		url_pathname = '/'				
+		file_name = 'index.html'
+	else:
+		file_name = url.split('/')[-1] # else save the filename as the last object after splitting the url
+	return url_hostname
+
+
+def get_request(url_hostname,url_pathname):			# construct GET request
+	request ='GET ' + url_pathname + ' HTTP/1.0\r\n'+'Host: '+url_hostname+'\r\n\r\n'
+	return request
+
+########################################################################################################
+##### create sender and receiver socket############################################	
+
+
+
+def create_sender_socket():
+	
+	try:
+		send_sock=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0800))
+		send_sock.bind(("eth0",socket.htons(0x0800)))
+		
+		 
+	except (socket.timeout,socket.error), msg :
+		print "Error in  creating/Timemout sender raw socket: %s " %msg
+		sys.exit()
+	return send_sock
+
+
+
+def create_receive_socket():
+	try:
+		receive_sock = socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0800))
+		#receive_sock.bind(("eth0",socket.SOCK_RAW))
+		#receive_sock.setsockopt(socket.SOL_SOCKET, IN.SO_BINDTODEVICE, "eth0"+'\0')
+	except (socket.timeout,socket.error), msg :
+		print "error in creating revever raw socket: %s " %msg
+		sys.exit()
+	return receive_sock
+
+######################################################################################################
+
+######################Build tcp and ip header####################################################
+
+def build_tcp_header(src_port,dest_port,seq_no,ack_no,ackf,synf,finf,pshf):
+	global data_get_req
+	
+	tcp_flags = finf + (synf << 1) + (rstf << 2) + (pshf << 3) + (ackf << 4) + (urgf << 5)
+	#print tcp_flags
+
+	tcp_header = pack('!HHLLBBHHH' , src_port , dest_port , seq_no , ack_no , doff_res , tcp_flags , window , chk_sum , urg_ptr )
+
+	                ####creating pseudo header####
+
+	if (len(data_get_req) % 2 != 0):
+		data_get_req = data_get_req + " "
+
+	src_add_ip = socket.inet_aton(source_ip)
+	dst_add_ip = socket.inet_aton(dest_ip)
+	plc_hldr = 0
+	protocol = socket.IPPROTO_TCP
+	tcp_len = len(tcp_header)
+	if (pshf == 1) :
+		
+		tcp_len = len(tcp_header) + len(data_get_req)
+	
+	#print tcp_len
+
+
+	pseudo_hdr = pack('!4s4sBBH' , src_add_ip , dst_add_ip , plc_hldr , protocol , tcp_len)
+	
+	if (pshf == 1):
+
+		pseudo_hdr = pseudo_hdr + tcp_header + data_get_req
+
+	else:
+
+		pseudo_hdr = pseudo_hdr + tcp_header
+	#print len(pseudo_hdr)
+	tcp_checksum = checksum(pseudo_hdr)
+	
+
+	# actual tcp header to be sent after calculating the checksum
+	tcp_header = pack('!HHLLBBH', src_port , dest_port , seq_no , ack_no , doff_res , tcp_flags , window) + pack('!H' , tcp_checksum) + pack ('!H' , urg_ptr)
+	return tcp_header
+#----------------------------------------------------------------------------------------------
+def build_ip_header(tcp_header,total_length):
+	
+	#print total_length
+	IP_checksum = 0
+	src_ip = socket.inet_aton(source_ip)
+	dst_ip = socket.inet_aton(dest_ip)
+	
+
+	ip_header = pack('!BBHHHBBH4s4s', version_IHL, type_of_service , total_length , packet_ID , fragment_status , TTL , protocol , IP_checksum , src_ip , dst_ip)
+	#print len(ip_header)
+	
+	IP_checksum = checksum(ip_header)
+    
+	ip_header = pack('!BBHHHBB', version_IHL, type_of_service , total_length , packet_ID , fragment_status , TTL , protocol)+pack('!H', IP_checksum)+pack('!4s4s', src_ip , dst_ip)
+
+	
+	return ip_header
+#####################################################################################################################
+
+###calculate checksum##
+
+def checksum(msg):
+
+	su = 0	
+
+	for i in range (0, len(msg),2):
+		
+		w = (ord(msg[i]) << 8) + (ord(msg[i+1]))
+		su = su + w
+
+	su = (su >> 16) + (su & 0xffff)
+
+	su = ~su & 0xffff 
+	#print su
+
+	return su  
+
+#########################ARP request##########################
+
+def get_gateway_mac():
+	global dest_mac
+	global my_mac_add
+	
+	arp_send_sock = socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0806))
+
+	arp_send_sock.bind(("eth0",socket.SOCK_RAW))
+	
+	my_mac_add = arp_send_sock.getsockname()[4] 
+	 #print my_mac_add,type(my_mac_add)
+
+
+	gateway_ip = subprocess.check_output("netstat -rn | grep '^0.0.0.0' | awk '{print $2}'",shell=True)
+	#hardware_type = pack('!H',0x0001) # for ethernet
+	eth_protocol_type = pack('!H',0x0806) # ip protocol
+	#hw_ad_len = pack('!B',0x0006) # hw address length in bytes
+	#protocol_ad_len = pack('!B',0x0004) # ipv4 address length
+	op_code = pack('!H',0x0001) # ARP request
+	sender_hw_add = (my_mac_add)
+	sender_ip = pack('!4B',*[int(a) for a in source_ip.split('.')])
+	destiny_ip = pack('!4B',*[int(a) for a in gateway_ip.split('.')])
+	brdcast_mac_add = pack('!6B',*(0xFF,)*6)
+	dest_mac_add = pack('!6B',*(0x00,)*6)
+	arp_protocol_mac_ip=pack('!HHBB', 0x0001, 0x0800, 0x0006, 0x0004) # arp packet starts here , 1 hw type, 8- IP protocol, 6 mac len, 4 ip len
+
+	arp_frame = [brdcast_mac_add,sender_hw_add,eth_protocol_type,arp_protocol_mac_ip,op_code,sender_hw_add,sender_ip,dest_mac_add,destiny_ip]
+	i = 0
+	for i in range (1,4):
+		arp_send_sock.send(''.join(arp_frame))
+	
+		recv_arp_sock = socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0806))
+	#recv_arp_sock.settimeout(5)
+
+	
+		while True:
+			received_arp_pack = recv_arp_sock.recvfrom(65536)
+			eth_header = unpack("!6s6s2s",received_arp_pack[0][0:14])
+			arp_header = unpack("!2s2s1s1s2s6s4s6s4s",received_arp_pack[0][14:42])
+			ethertype = eth_header[2]
+			if ethertype == '\x08\x06':
+				
+
+				dest_mac = eth_header[1]
+				arp_send_sock.close()
+				recv_arp_sock.close()
+				#print binascii.hexlify(eth_header[1])
+				return dest_mac
+
+
+
+
+###TCP 3 way handshake, after receiving SYN,ACK from server,we send ACK along with the GET request(data)
+###when sending data, pshf(push flag )is enabled to send data up to the application layer at the server
+
+def perform_handshake():
+
+###### Send initial packet, with SYN flag set
+	seq_no = 0
+	ack_no = 0
+	ackf = 0
+	synf = 1
+	finf = 0
+	pshf = 0
+	
+	total_length = 40 
+	#BUild TCP and IP headers 
+
+	tcp_header = build_tcp_header(src_port, dest_port, seq_no, ack_no, ackf, synf, finf,pshf)
+	ip_header = build_ip_header(tcp_header,total_length)
+	
+	
+	packet = ip_header + tcp_header  ## encapsulate the tcp and IP headers to be sent 
+	
+	
+	eth_frame = [dest_mac,my_mac_add,"\x08\x00",packet]
+	send_sock.send(''.join(eth_frame))
+#------------------------------------------------------------#
+############### receive the packet with SYN,ACK flag set
+	recv_msg = receive_sock.recv(65535)
+
+	#print (recv_msg)
+	
+	ipHead=unpack("!BBHHHBBH4s4s",recv_msg[14:34])
+	#print ipHead
+	tcpHead=unpack('!HHLLBBHHH',recv_msg[34:54])
+	serverIP=socket.inet_ntoa(ipHead[8])
+	my_port=str(tcpHead[1])
+
+	if (serverIP == str(dest_ip) and my_port == str(src_port)):	## check for the IP and sockets,match the source and destiantion
+		
+		if (tcpHead[5] == 18):			# If the ACK flag is set in the TCP header
+			seq_no_recv = tcpHead[2]
+			ack_no_recv = tcpHead[3]
+
+#------------------------------------------------------------#
+############ Send ACK to the previous SYN,ACK
+	if ack_no_recv :
+		seq_no = ack_no_recv
+		ack_no = seq_no_recv + 1
+		ackf = 1
+		synf = 0
+		pshf = 1
+		total_length = 40 + len(data_get_req)
+
+		tcp_header = build_tcp_header(src_port, dest_port, seq_no, ack_no, ackf, synf, finf,pshf)
+		ip_header = build_ip_header(tcp_header,total_length)
+		packet = ip_header + tcp_header + data_get_req
+		eth_frame = [dest_mac,my_mac_add,"\x08\x00",packet]
+		send_sock.send(''.join(eth_frame))
+
+	recv_msg = receive_sock.recv(65535)
+
+
+##################code execution begins from here####
+
+source_ip = get_my_ip()
+url_parser(url)
+dest_ip = socket.gethostbyname(url_hostname)
+#print source_ip
+
+data = {}
+dest_mac=get_gateway_mac()
+#print dest_ip
+send_sock = create_sender_socket()
+receive_sock = create_receive_socket()
+receive_sock.settimeout(180)
+send_sock.settimeout(180)
+
+data_get_req = get_request(url_hostname,url_pathname)
+perform_handshake()
+
+
+
+##### Handle window###
+def cwnd_size():
+	if cwnd_size <= 1000 and ssh_trsh == 0:
+		cwnd_size = cwnd_size * 2
+	elif cwnd_size < 1000 and ssh_trsh !=0:
+		if cwnd_size < ssthresh:
+			cwnd_size = cwnd_size*2
+		else:
+			cwnd_size = cwnd_size + 1
+	else:
+		ssh_trsh = cwnd_size / 2
+		cwnd_size = 1
+
+	return cwnd_size
+
+
+### Handling the HTTP reply from the server--
+#   handles data, checksum verification, sending ack and connection teardown
+def handle_reply():
+	
+	total_data_1 = ''
+	fin_seq = 0
+	pshf = 0
+	ackf = 1
+	synf = 0
+	finf = 0
+	
+	while 1:
+
+		#try:
+		recv_msg = receive_sock.recv(65535)
+		eth_frame = recv_msg
+
+		if len(recv_msg) == 60:
+
+			received_ip_header = unpack('!BBHHHBBH4s4s',recv_msg[20:40])			# receive the packet and verify SOurce, Destination IP and port
+		#print received_ip_header
+		
+			received_tcp_header = unpack('!HHLLBBHHH',recv_msg[40:60])
+		#print received_tcp_header
+			received_data = recv_msg[60:]
+
+		else:
+
+			received_ip_header = unpack('!BBHHHBBH4s4s',recv_msg[14:34])			# receive the packet and verify SOurce, Destination IP and port
+		
+			received_tcp_header = unpack('!HHLLBBHHH',recv_msg[34:54])
+	
+			received_data = recv_msg[54:]
+
+
+
+		server_IP = socket.inet_ntoa(received_ip_header[8])
+		my_port = received_tcp_header[1]
+		
+		if (server_IP == dest_ip and my_port == src_port) :
+			#print "here"
+
+
+			placeholder = 0
+
+			########################### build Pseudo header of the received packet to verify checksum
+			tcp_hdr = pack('!HHLLBBHHH',received_tcp_header[0],received_tcp_header[1],received_tcp_header[2],received_tcp_header[3],received_tcp_header[4],received_tcp_header[5],received_tcp_header[6],0,received_tcp_header[8])
+			pseudo_hdr = pack('!4s4sBBH' , received_ip_header[8] , received_ip_header[9] , placeholder , received_ip_header[6], received_ip_header[2] - 20)
+
+			total_data_1 = total_data_1 + received_data
+			
+			### Append the data with a byte if the data length is odd
+			if (len(received_data )% 2 != 0):
+				received_data = received_data + ' '
+			
+
+			pseudo_hdr = pseudo_hdr + tcp_hdr + received_data
+
+
+			if received_tcp_header[7] == checksum(pseudo_hdr):		## calculated checksum is compared with the checksum in the received tcp header
+				
+				data[received_tcp_header[2]] = received_data		# Dictionary to store sequence number as keys and data as values
+
+				seq_no = received_tcp_header[3]
+
+				if received_data:
+
+					if received_tcp_header[5] != 25:
+						
+						ack_no = received_tcp_header[2] + len(received_data)	#if data sent by server, ack_no = previous sequence_no + length of data
+					else:
+						ack_no = received_tcp_header[2] + 1	             
+				
+				else:
+						ack_no = received_tcp_header[2] + 1						# if no data, ack = seq + 1
+						
+				if received_tcp_header[5] == 25:							# save the sequence number of FIN,ACK,PSH flag
+					fin_seq = received_tcp_header[2]
+
+				if fin_seq:
+
+					if (ack_no - 1 == fin_seq):								# if all the packets upto the FIN packet are acked, set the FIN flag to be sent
+
+						finf = 1
+		
+
+				total_length = 40
+				tcp_header = build_tcp_header(src_port, dest_port, seq_no, ack_no, ackf, synf, finf,pshf)
+				packet = build_ip_header(tcp_header,total_length) + tcp_header
+				
+				try:
+
+					eth_frame = [dest_mac,my_mac_add,"\x08\x00",packet]
+
+					send_sock.send(''.join(eth_frame))
+
+				except (socket.timeout,socket.error),msg:
+					print "Socket timed out %s" %msg
+					send_sock.close()
+					receive_sock.close()
+					
+
+					
+				if (finf == 1):												# if fin is set and sent, open a file and write the data received by splitting out the HTTP header
+					new_file = open(file_name, "w")
+					new_file.writelines(total_data_1.split("\r\n\r\n")[1]) 
+					return													# exit loop after FIN flag is sent
+
+
+
+
+
+				
+handle_reply()				# function call to handle data
+
+send_sock.close()			# sender and receiver sockets close
+receive_sock.close()
