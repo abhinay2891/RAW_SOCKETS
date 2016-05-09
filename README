@@ -1,0 +1,33 @@
+Implemented Ethernet, IP and TCP functionalities
+In this project , we have created two raw sockets: one for receiving packets and one for sending packets. The receive socket is of type SOCK_STREAM/IPPROTO_IP; the send socket must be of type SOCK_RAW/IPPROTO_RAW. Also, we have bind to the IPPROTO_IP interface to receive packets. To implement TCP and IP, we have used SOCK_RAW/IPPROTO_RAW socket.
+
+We have also implemented a basic congestion window which start with cwnd=1, and increment the cwnd after each succesful ACK, up to a fixed maximum of 1000 (e.g. cwnd must be <=1000 at all times). If there is a  packet drop or a timeout, reset the cwnd to 1.
+Our code must be able to receive out-of-order incoming packets and put them back into the correct order before delivering them to the higher-level, HTTP handling code with identifying and discarding the duplicate packets. In case there is no reception of  any data from the remote server for three minutes, by checking receive_sock.settimeout(180), send_sock.settimeout(180), our code assume that the connection has failed.
+
+Steps:
+
+1. We have extracted source and destination IP Address by parsing the url to extract the hostname and pathname.
+2. TCP and header fields are filled with the source iP address and Destination Ip with other files like checksum, Flags, type of service etc.
+3. Then sender and receiver sockets send_sock and receive_sock are created.Then we built The tcp header  and Ip header by packing the fields and also a pseudo header is constructed to compute the checksum. The checksum is calculated over the tcp header along with the data to detect errors in the transmission on the receiver side.
+4. Initially we set the SYN flag up and send the initial packet from the sending socket with encapsulation of the TCP and IP headers to be sent so that we could receive a response from receiver with SYN,ACK flag set. Also, from the response received , we check for the IP and sockets and match the source and destination are correct.If the ACK flag is set in the TCP header received, send ACK to the previous SYN, ACK. TCP 3 way handshake completes when after receiving SYN, ACK from server, we send ACK along with the GET request(data). While sending the data, pshf(push flag) is enabled to send data up to the application layer at the server.
+5. We have a function handle_reply in which we are handling the HTTP reply from the server. It handles data, checksum verification, sending the data and teardown the connection. When we receive the packet, we verify the source IP, Destination IP and the port. We are building a Pseudo header of the received packet to verify the checksum, if the data length is odd we are appending it by one byte . Then checksum is calculated with the checksum checksum in the received TCP header.
+6. We have created a dictionary to store the sequence  numbers as keys and data as values. We check in our program that if data sent by server, ack_no = previous sequence_no + length of data. If no data, ack= seq+1.
+7. We are also taking care of the condition that if all the packets unto FIN packet are asked, set the FIN flag to be sent. After Fin is set and sent, we are opening a file and writing the data received by splitting out the HTTP header. At the end, we are closing the sender and receiver sockets.
+
+Ethernet:
+
+We implemented the ethernet part of the project.
+Created ARP send and receive socket separately
+1. We retrieved the MAC address of the host machine first and then created a arp packet and embedded it within an ethernet frame with socket for ARP type (806)
+2.The destaination MAC returned from the ARP request was used to send subsequesnt packets to the server.
+3.The ethernet frame included - Destination mac+ sourcemac+protocol_type(800 IP) in our case + upperlayer data
+4.Handling of data was same as above
+
+Challenges:
+
+1.Code optimization: Initially when we made function call in the receiving socket loop, we lost many packets and this caused lots of retransmission.We rewrote the code to a linear form and limiting the function call from withing the loop. Our code performed better and the retransmissions reduced significantly
+2.Handling FIN - Initially I sent a FIN to the FIN,ACK I received without waiting to acknowledge the previous received data.This caused the server to retransmit even after I had sent FIN.
+To overcome this , I made the client send a FIN pavket only after all the previous packets were acknowledged and storing the sequence number of FIN,ACK packet received from the server.
+3.Due to retransmission, I received packets multiple times. I had to imporve in storing the data and only once.I created a dictionary with keys as sequence numbers and data as their values.Sorted the keys so that the data was sorted.
+4.Sending the ethernet frame was not much of a task but handling the ARP reply was a challenge, most of the times the receiver arp socket did not receive the ARP reply, we had to re run the code for proper reception.
+5.The ethernet frame padded 0s at the end when the server sent FIN,ACK,PSH flag, we had to remove the padded bits and append only data.It was a challenge to figure the error, only upon thoroughly going through the wireshark trace we could figure the issue.
